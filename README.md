@@ -4,12 +4,15 @@ A tiny local coordinator for burning down cyclomatic complexity with multiple AI
 
 This is not a feature-building framework. It is deliberately narrow: scan a target repo for complex Ruby methods, put the methods into SQLite-backed batches, let isolated worktree agents claim one batch at a time, and merge completed branches back through a single lock.
 
+It also includes a small Ruby duplicate-code finder. It uses normalized `Ripper` syntax fingerprints and Jaccard similarity to report methods with similar structure, even when names and literal values differ.
+
 It was extracted from a real Rails cleanup run and scrubbed for public use. The repo contains no live queue database, process IDs, logs, private project paths, generated reports, or application code.
 
 ## What It Is Good For
 
 - Mechanical refactors where the success metric is objective.
 - Reducing `Metrics/CyclomaticComplexity` in Ruby/Rails repos.
+- Finding candidate duplicate Ruby methods before assigning cleanup work.
 - Running several low-reasoning agents safely because each gets a narrow file/method list.
 - Keeping merge state explicit instead of trusting agents to coordinate in chat.
 
@@ -113,6 +116,12 @@ bin/burndown-worktrees sync
 bin/burndown-tmux
 ```
 
+Duplicate finder:
+
+```bash
+bin/ruby-duplicates [options] [file-or-directory ...]
+```
+
 ## Configuration
 
 Environment variables:
@@ -129,6 +138,36 @@ Example:
 
 ```bash
 BURNDOWN_AGENTS="A B" BURNDOWN_TARGET_MIN_CC=8 bin/burndown backfill 1 4
+```
+
+## Duplicate Code Metric
+
+`bin/ruby-duplicates` is a simple Ruby version of the structural metric used by `dry4clj`: normalize syntax, fingerprint subtrees, then compare methods with Jaccard similarity.
+
+```bash
+bin/ruby-duplicates app lib test
+bin/ruby-duplicates --threshold 0.9 --min-lines 5 --min-nodes 30 app
+bin/ruby-duplicates --json app/models app/controllers
+```
+
+Options:
+
+```bash
+--threshold N    Minimum similarity score, default 0.82
+--min-lines N    Minimum method source lines, default 4
+--min-nodes N    Minimum normalized syntax nodes, default 20
+--max-results N  Maximum matches to print, default 50
+--format F       text or json, default text
+--json           Same as --format json
+--ignore-dir N   Directory basename or path to skip; may be repeated
+```
+
+Example output:
+
+```text
+DUPLICATE score=1.00 shared=21
+  examples/duplicate_sample.rb:1-4 alpha nodes=64
+  examples/duplicate_sample.rb:7-10 beta nodes=64
 ```
 
 ## State Files
