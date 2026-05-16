@@ -1,0 +1,665 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "fileutils"
+require "json"
+require "open3"
+require "shellwords"
+require "sqlite3"
+require "time"
+require "tmpdir"
+require "zlib"
+
+TARGET_ROOT = File.expand_path(ENV.fetch("BURNDOWN_TARGET_REPO", Dir.pwd))
+STATE_DIR = File.expand_path(ENV.fetch("BURNDOWN_STATE_DIR", File.join(TARGET_ROOT, ".burndown-swarm")))
+DB_PATH = File.join(STATE_DIR, "coordination.sqlite3")
+SUMMARY_PATH = File.join(STATE_DIR, "BURNDOWN_COORDINATION.md")
+TSV_PATH = File.join(STATE_DIR, "current-complexity.tsv")
+AGENTS = ENV.fetch("BURNDOWN_AGENTS", "A B C D").split(/\s+/).reject(&:empty?).freeze
+BRANCH_PREFIX = ENV.fetch("BURNDOWN_BRANCH_PREFIX", "agent")
+TARGET_MIN_CC = Integer(ENV.fetch("BURNDOWN_TARGET_MIN_CC", "5"))
+
+class Burndown
+  def initialize
+    abort "BURNDOWN_AGENTS cannot be empty" if AGENTS.empty?
+
+    FileUtils.mkdir_p(STATE_DIR)
+    @db = SQLite3::Database.new(DB_PATH)
+    @db.results_as_hash = true
+    @db.busy_timeout = 10_000
+  end
+
+  def init
+    execute_batch <<~SQL
+      PRAGMA journal_mode = WAL;
+
+      CREATE TABLE IF NOT EXISTS batches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent TEXT NOT NULL,
+        title TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'open',
+        target TEXT,
+        branch TEXT,
+        claimed_at TEXT,
+        completed_at TEXT,
+        merged_at TEXT,
+        commit_sha TEXT,
+        merge_commit_sha TEXT,
+        checks TEXT,
+        notes TEXT,
+        conflict_files TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        batch_id INTEGER NOT NULL,
+        file_path TEXT NOT NULL,
+        method_name TEXT NOT NULL,
+        line INTEGER,
+        cc INTEGER NOT NULL,
+        current_cc INTEGER,
+        status TEXT NOT NULL DEFAULT 'open',
+        FOREIGN KEY(batch_id) REFERENCES batches(id)
+      );
+
+      CREATE TABLE IF NOT EXISTS snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        commit_sha TEXT NOT NULL,
+        method_count INTEGER NOT NULL,
+        gt_target INTEGER NOT NULL,
+        gt7 INTEGER NOT NULL,
+        gt16 INTEGER NOT NULL,
+        p90 INTEGER NOT NULL,
+        p95 INTEGER NOT NULL,
+        p99 INTEGER NOT NULL,
+        max_cc INTEGER NOT NULL,
+        captured_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS merge_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent TEXT NOT NULL,
+        batch_id INTEGER,
+        status TEXT NOT NULL,
+        commit_sha TEXT,
+        notes TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS locks (
+        name TEXT PRIMARY KEY,
+        holder TEXT,
+        acquired_at TEXT
+      );
+    SQL
+
+    say "Initialized #{DB_PATH}"
+  end
+
+  def refresh
+    init
+    report = complexity_report
+    File.write(TSV_PATH, report.map { |offense| offense.values_at(:cc, :file_path, :line, :method_name).join("\t") }.join("\n") + "\n")
+
+    commit = git(TARGET_ROOT, "rev-parse", "--short", "HEAD").strip
+    ccs = report.map { |row| row[:cc] }.sort
+    snapshot = {
+      commit_sha: commit,
+      method_count: ccs.length,
+      gt_target: ccs.count { |cc| cc >= TARGET_MIN_CC },
+      gt7: ccs.count { |cc| cc > 7 },
+      gt16: ccs.count { |cc| cc > 16 },
+      p90: percentile(ccs, 90),
+      p95: percentile(ccs, 95),
+      p99: percentile(ccs, 99),
+      max_cc: ccs.max || 0
+    }
+
+    execute(
+      "INSERT INTO snapshots (commit_sha, method_count, gt_target, gt7, gt16, p90, p95, p99, max_cc, captured_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      snapshot.values_at(:commit_sha, :method_count, :gt_target, :gt7, :gt16, :p90, :p95, :p99, :max_cc),
+      timestamp
+    )
+
+    report.each do |offense|
+      execute(
+        "UPDATE tasks SET current_cc = ? WHERE file_path = ? AND method_name = ?",
+        offense[:cc],
+        offense[:file_path],
+        offense[:method_name]
+      )
+    end
+
+    puts "commit=#{snapshot[:commit_sha]}"
+    puts "methods=#{snapshot[:method_count]}"
+    puts "target_min_cc=#{TARGET_MIN_CC} queued_candidates=#{snapshot[:gt_target]} gt7=#{snapshot[:gt7]} gt16=#{snapshot[:gt16]}"
+    puts "p90=#{snapshot[:p90]} p95=#{snapshot[:p95]} p99=#{snapshot[:p99]} max=#{snapshot[:max_cc]}"
+    puts "top:"
+    report.first(30).each do |offense|
+      puts offense.values_at(:cc, :file_path, :line, :method_name).join("\t")
+    end
+
+    write_md
+  end
+
+  def backfill(target_open = 2, batch_size = 6)
+    init
+    abort "Missing #{TSV_PATH}; run `bin/burndown refresh` first." unless File.exist?(TSV_PATH)
+
+    prune_stale_open(silent: true)
+    active = active_task_keys
+    selected = {}
+    tasks = File.readlines(TSV_PATH, chomp: true).filter_map do |line|
+      cc, file_path, line_number, method_name = line.split("\t", 4)
+      task = {
+        cc: cc.to_i,
+        file_path: file_path,
+        line: line_number.to_i,
+        method_name: method_name
+      }
+      next if task[:cc] < TARGET_MIN_CC || task[:file_path].to_s.empty? || task[:method_name].to_s.empty?
+      next if active[[task[:file_path], task[:method_name]]]
+
+      task
+    end.sort_by { |task| [-task[:cc], task[:file_path], task[:line], task[:method_name]] }
+
+    by_agent = AGENTS.to_h { |agent| [agent, []] }
+    tasks.each { |task| by_agent[agent_for(task)] << task }
+
+    created = []
+    transaction(:immediate) do
+      AGENTS.each do |agent|
+        open_count = @db.get_first_value("SELECT count(*) FROM batches WHERE agent = ? AND status = 'open'", agent).to_i
+        [target_open.to_i - open_count, 0].max.times do |index|
+          batch_tasks = pick_tasks(by_agent[agent], tasks, selected, batch_size.to_i)
+          break if batch_tasks.empty?
+
+          title = "CC burn #{agent} #{Time.now.strftime("%H%M%S")}-#{index + 1}"
+          execute(
+            "INSERT INTO batches (agent, title, status, target, branch, created_at, updated_at) VALUES (?, ?, 'open', ?, ?, ?, ?)",
+            agent,
+            title,
+            "Reduce listed methods below the next useful complexity threshold. Do not broaden scope.",
+            branch_for_agent(agent),
+            timestamp,
+            timestamp
+          )
+          batch_id = @db.last_insert_row_id
+          batch_tasks.each do |task|
+            execute(
+              "INSERT INTO tasks (batch_id, file_path, method_name, line, cc, current_cc, status) VALUES (?, ?, ?, ?, ?, ?, 'open')",
+              batch_id,
+              task[:file_path],
+              task[:method_name],
+              task[:line],
+              task[:cc],
+              task[:cc]
+            )
+          end
+          created << [batch_id, agent, batch_tasks.length, title]
+        end
+      end
+    end
+
+    puts(created.empty? ? "no new batches" : created.map { |entry| entry.join("\t") })
+    write_md
+  end
+
+  def prune_stale_open(silent: false)
+    return unless File.exist?(TSV_PATH)
+
+    current = {}
+    File.readlines(TSV_PATH, chomp: true).each do |line|
+      cc, file_path, _line_number, method_name = line.split("\t", 4)
+      current[[file_path, method_name]] = cc.to_i
+    end
+
+    deleted = 0
+    stale_batches = []
+    transaction(:immediate) do
+      rows(<<~SQL).each do |task|
+        SELECT tasks.id, tasks.batch_id, tasks.file_path, tasks.method_name
+        FROM tasks
+        JOIN batches ON batches.id = tasks.batch_id
+        WHERE batches.status = 'open'
+      SQL
+        actual_cc = current[[task["file_path"], task["method_name"]]].to_i
+        next if actual_cc >= TARGET_MIN_CC
+
+        execute("DELETE FROM tasks WHERE id = ?", task["id"])
+        deleted += 1
+      end
+
+      rows("SELECT id FROM batches WHERE status = 'open'").each do |batch|
+        next unless @db.get_first_value("SELECT count(*) FROM tasks WHERE batch_id = ?", batch["id"]).to_i.zero?
+
+        execute("UPDATE batches SET status = 'stale', notes = ?, updated_at = ? WHERE id = ?", "all tasks already below target", timestamp, batch["id"])
+        stale_batches << batch["id"]
+      end
+    end
+
+    return if silent
+
+    puts "deleted_tasks=#{deleted}"
+    puts "stale_batches=#{stale_batches.join(",")}"
+    write_md
+  end
+
+  def claim(agent)
+    agent = normalize_agent(agent)
+    transaction(:immediate) do
+      active = row("SELECT * FROM batches WHERE agent = ? AND status = 'claimed' ORDER BY id LIMIT 1", agent)
+      batch = active || row("SELECT * FROM batches WHERE agent = ? AND status = 'open' ORDER BY id LIMIT 1", agent)
+      abort "No open batch for agent #{agent}" unless batch
+
+      unless active
+        execute("UPDATE batches SET status = 'claimed', claimed_at = ?, updated_at = ? WHERE id = ?", timestamp, timestamp, batch["id"])
+        batch = row("SELECT * FROM batches WHERE id = ?", batch["id"])
+      end
+
+      print_batch(batch)
+    end
+  end
+
+  def complete(agent, batch_id, commit_sha, checks = nil)
+    agent = normalize_agent(agent)
+    execute(
+      "UPDATE batches SET status = 'complete', commit_sha = ?, checks = ?, completed_at = ?, updated_at = ? WHERE id = ? AND agent = ?",
+      commit_sha,
+      checks.to_s,
+      timestamp,
+      timestamp,
+      batch_id,
+      agent
+    )
+    say "Marked batch #{batch_id} complete for agent #{agent}"
+    write_md
+  end
+
+  def conflict(agent, batch_id, notes = "")
+    agent = normalize_agent(agent)
+    files = conflicted_files
+    execute(
+      "UPDATE batches SET status = 'conflict', conflict_files = ?, notes = ?, updated_at = ? WHERE id = ? AND agent = ?",
+      files.join("\n"),
+      notes.to_s,
+      timestamp,
+      batch_id,
+      agent
+    )
+    execute(
+      "INSERT INTO merge_events (agent, batch_id, status, notes, created_at) VALUES (?, ?, 'conflict', ?, ?)",
+      agent,
+      batch_id,
+      notes.to_s,
+      timestamp
+    )
+    say "Marked batch #{batch_id} conflict for agent #{agent}"
+    write_md
+  end
+
+  def self_merge(agent, batch_id)
+    agent = normalize_agent(agent)
+    batch = row("SELECT * FROM batches WHERE id = ? AND agent = ?", batch_id, agent)
+    abort "Unknown batch #{batch_id} for agent #{agent}" unless batch
+    abort "Batch #{batch_id} must be complete before merge" unless batch["status"] == "complete"
+
+    transaction(:immediate) do
+      lock = row("SELECT * FROM locks WHERE name = 'main_merge'")
+      abort "Merge lock held by #{lock["holder"]} since #{lock["acquired_at"]}" if lock && lock["holder"]
+
+      execute(
+        "INSERT INTO locks (name, holder, acquired_at) VALUES ('main_merge', ?, ?) ON CONFLICT(name) DO UPDATE SET holder = excluded.holder, acquired_at = excluded.acquired_at",
+        agent,
+        timestamp
+      )
+    end
+
+    begin
+      assert_clean_target!
+      status = system("git", "-C", TARGET_ROOT, "merge", "--no-edit", branch_for_agent(agent))
+      unless status
+        system("git", "-C", TARGET_ROOT, "merge", "--abort", out: File::NULL, err: File::NULL)
+        conflict(agent, batch_id, "self_merge failed; manual merge needed")
+        abort "Merge failed; batch marked conflict"
+      end
+
+      merge_commit = git(TARGET_ROOT, "rev-parse", "--short", "HEAD").strip
+      execute(
+        "UPDATE batches SET status = 'merged', merge_commit_sha = ?, merged_at = ?, updated_at = ? WHERE id = ? AND agent = ?",
+        merge_commit,
+        timestamp,
+        timestamp,
+        batch_id,
+        agent
+      )
+      execute(
+        "INSERT INTO merge_events (agent, batch_id, status, commit_sha, notes, created_at) VALUES (?, ?, 'merged', ?, 'self_merge', ?)",
+        agent,
+        batch_id,
+        merge_commit,
+        timestamp
+      )
+      say "Merged batch #{batch_id} from agent #{agent} at #{merge_commit}"
+      write_md
+    ensure
+      execute("UPDATE locks SET holder = NULL, acquired_at = NULL WHERE name = 'main_merge'")
+    end
+  end
+
+  def status
+    snapshot = row("SELECT * FROM snapshots ORDER BY id DESC LIMIT 1")
+    if snapshot
+      puts "Snapshot #{snapshot["commit_sha"]} at #{snapshot["captured_at"]}: target>=#{TARGET_MIN_CC}=#{snapshot["gt_target"]} p90=#{snapshot["p90"]} p95=#{snapshot["p95"]} p99=#{snapshot["p99"]} max=#{snapshot["max_cc"]}"
+    else
+      puts "No snapshot yet. Run refresh."
+    end
+
+    puts "\nBatches:"
+    rows("SELECT * FROM batches ORDER BY id").each do |batch|
+      puts "#{batch["id"]}. agent #{batch["agent"]} #{batch["status"]} #{batch["title"]} #{batch["commit_sha"]} #{batch["merge_commit_sha"]}"
+    end
+
+    puts "\nBranch heads:"
+    AGENTS.each do |agent|
+      puts "#{branch_for_agent(agent)}: #{left_right("main", branch_for_agent(agent))}"
+    end
+
+    lock = row("SELECT holder, acquired_at FROM locks WHERE name = 'main_merge'")
+    puts "\nMerge lock: #{lock && lock["holder"] ? "#{lock["holder"]} #{lock["acquired_at"]}" : "free"}"
+  end
+
+  def prompt(agent)
+    agent = normalize_agent(agent)
+    batch = row("SELECT * FROM batches WHERE agent = ? AND status IN ('claimed', 'complete') ORDER BY id LIMIT 1", agent)
+    batch ||= row("SELECT * FROM batches WHERE agent = ? AND status = 'open' ORDER BY id LIMIT 1", agent)
+    abort "No batch for agent #{agent}" unless batch
+
+    puts agent_prompt(batch)
+  end
+
+  def write_md
+    snapshot = row("SELECT * FROM snapshots ORDER BY id DESC LIMIT 1")
+    File.open(SUMMARY_PATH, "w") do |file|
+      file.puts "# Complexity burndown coordination"
+      file.puts
+      file.puts "Generated from `#{DB_PATH}` at #{timestamp}."
+      file.puts
+      if snapshot
+        file.puts "## Latest Snapshot"
+        file.puts
+        file.puts "- Target repo: `#{TARGET_ROOT}`"
+        file.puts "- Commit: `#{snapshot["commit_sha"]}`"
+        file.puts "- Target minimum CC: `#{TARGET_MIN_CC}`"
+        file.puts "- Counts: `>=target #{snapshot["gt_target"]}`, `>7 #{snapshot["gt7"]}`, `>16 #{snapshot["gt16"]}`"
+        file.puts "- P90/P95/P99/max: `#{snapshot["p90"]}` / `#{snapshot["p95"]}` / `#{snapshot["p99"]}` / `#{snapshot["max_cc"]}`"
+        file.puts
+      end
+
+      file.puts "## Batch Status"
+      file.puts
+      rows("SELECT * FROM batches ORDER BY id").each do |batch|
+        file.puts "- Batch #{batch["id"]} Agent #{batch["agent"]} `#{batch["status"]}` - #{batch["title"]}"
+        file.puts "  - Branch: `#{batch["branch"]}`"
+        file.puts "  - Commit: `#{batch["commit_sha"]}`" if present?(batch["commit_sha"])
+        file.puts "  - Merge: `#{batch["merge_commit_sha"]}`" if present?(batch["merge_commit_sha"])
+        file.puts "  - Notes: #{batch["notes"]}" if present?(batch["notes"])
+      end
+      file.puts
+
+      file.puts "## Commands"
+      file.puts
+      file.puts "- Claim: `bin/burndown claim <#{AGENTS.join("|")}>`"
+      file.puts "- Complete: `bin/burndown complete <agent> <batch_id> <commit> '<checks>'`"
+      file.puts "- Self-merge: `bin/burndown self-merge <agent> <batch_id>`"
+      file.puts "- Conflict: `bin/burndown conflict <agent> <batch_id> '<notes>'`"
+    end
+  end
+
+  private
+
+  def agent_prompt(batch)
+    tasks = rows("SELECT * FROM tasks WHERE batch_id = ? ORDER BY current_cc DESC, file_path, method_name", batch["id"])
+    command = File.expand_path(__FILE__)
+    <<~PROMPT
+      You are Agent #{batch["agent"]} in an isolated worktree.
+
+      Use the sidecar coordinator:
+      #{Shellwords.escape(command)} claim #{batch["agent"]}
+
+      Your batch is #{batch["id"]}: #{batch["title"]}.
+      Target: #{batch["target"]}
+
+      First merge latest main into your worktree. Work only on this batch.
+      Reduce methods below the next useful threshold: <= 7 for methods currently >= 8, and <= 4 for any 5-7 methods you touch.
+      Do not broaden scope. Do not create new CC #{TARGET_MIN_CC}+ helpers.
+
+      Tasks:
+      #{tasks.map { |task| "- #{task["file_path"]} #{task["method_name"]} CC #{task["current_cc"] || task["cc"]}" }.join("\n")}
+
+      Run focused checks, then commit.
+
+      Record completion:
+      #{Shellwords.escape(command)} complete #{batch["agent"]} #{batch["id"]} <commit_sha> '<checks run>'
+
+      If the merge back to main is clean:
+      #{Shellwords.escape(command)} self-merge #{batch["agent"]} #{batch["id"]}
+
+      If merge conflicts or looks non-trivial, abort it and record:
+      #{Shellwords.escape(command)} conflict #{batch["agent"]} #{batch["id"]} '<short reason/files>'
+    PROMPT
+  end
+
+  def complexity_report
+    tmpdir = Dir.mktmpdir
+    config_path = File.join(tmpdir, "rubocop_complexity.yml")
+    report_path = File.join(tmpdir, "report.json")
+    File.write(config_path, "Metrics/CyclomaticComplexity:\n  Max: 0\n")
+
+    paths = %w[app lib test spec].select { |path| File.exist?(File.join(TARGET_ROOT, path)) }
+    paths = ["."] if paths.empty?
+    system(
+      "bundle",
+      "exec",
+      "rubocop",
+      "--only",
+      "Metrics/CyclomaticComplexity",
+      "--format",
+      "json",
+      "--config",
+      config_path,
+      *paths,
+      chdir: TARGET_ROOT,
+      out: report_path,
+      err: File::NULL
+    )
+
+    data = JSON.parse(File.read(report_path))
+    data.fetch("files").flat_map do |file|
+      file.fetch("offenses", []).filter_map do |offense|
+        message = offense.fetch("message")
+        next unless message =~ /Cyclomatic complexity for `(.+?)` is too high\. \[(\d+)\/0\]/
+
+        {
+          cc: Regexp.last_match(2).to_i,
+          file_path: relative_path(file.fetch("path")),
+          line: offense.fetch("location").fetch("start_line"),
+          method_name: Regexp.last_match(1)
+        }
+      end
+    end.sort_by { |offense| [-offense[:cc], offense[:file_path], offense[:line], offense[:method_name]] }
+  ensure
+    FileUtils.rm_rf(tmpdir) if tmpdir
+  end
+
+  def relative_path(path)
+    path = path.to_s
+    path.start_with?(TARGET_ROOT) ? path.delete_prefix("#{TARGET_ROOT}/") : path
+  end
+
+  def pick_tasks(primary, overflow, selected, batch_size)
+    tasks = []
+    [primary, overflow].each do |source|
+      while tasks.length < batch_size && (task = source.shift)
+        key = [task[:file_path], task[:method_name]]
+        next if selected[key]
+
+        selected[key] = true
+        tasks << task
+      end
+    end
+    tasks
+  end
+
+  def active_task_keys
+    rows(<<~SQL).map { |row| [[row["file_path"], row["method_name"]], true] }.to_h
+      SELECT tasks.file_path, tasks.method_name
+      FROM tasks
+      JOIN batches ON batches.id = tasks.batch_id
+      WHERE batches.status IN ('open', 'claimed', 'complete', 'conflict')
+    SQL
+  end
+
+  def agent_for(task)
+    AGENTS[Zlib.crc32(task[:file_path].to_s) % AGENTS.length]
+  end
+
+  def branch_for_agent(agent)
+    "#{BRANCH_PREFIX}/#{agent}"
+  end
+
+  def assert_clean_target!
+    status = git(TARGET_ROOT, "status", "--short")
+    abort "Target repo is dirty; refusing self-merge:\n#{status}" unless status.empty?
+  end
+
+  def conflicted_files
+    git(TARGET_ROOT, "diff", "--name-only", "--diff-filter=U").split("\n")
+  rescue StandardError
+    []
+  end
+
+  def left_right(left, right)
+    output, _err, status = Open3.capture3("git", "-C", TARGET_ROOT, "log", "--oneline", "--left-right", "--cherry-pick", "#{left}...#{right}")
+    return "missing" unless status.success?
+
+    ahead = output.lines.count { |line| line.start_with?(">") }
+    behind = output.lines.count { |line| line.start_with?("<") }
+    "ahead=#{ahead} behind=#{behind}"
+  end
+
+  def print_batch(batch)
+    puts "batch_id=#{batch["id"]}"
+    puts "agent=#{batch["agent"]}"
+    puts "status=#{batch["status"]}"
+    puts "title=#{batch["title"]}"
+    puts "branch=#{batch["branch"]}"
+    puts "target=#{batch["target"]}"
+    puts
+    rows("SELECT * FROM tasks WHERE batch_id = ? ORDER BY current_cc DESC, file_path, method_name", batch["id"]).each do |task|
+      puts [task["current_cc"] || task["cc"], task["file_path"], task["method_name"]].join("\t")
+    end
+  end
+
+  def normalize_agent(agent)
+    agent = agent.to_s.delete_prefix("agent-").delete_prefix("agent/").upcase
+    abort "Unknown agent #{agent.inspect}; expected one of #{AGENTS.join(", ")}" unless AGENTS.include?(agent)
+
+    agent
+  end
+
+  def percentile(values, pct)
+    return 0 if values.empty?
+
+    values[((pct / 100.0) * (values.length - 1)).ceil]
+  end
+
+  def present?(value)
+    !value.nil? && !value.to_s.empty?
+  end
+
+  def timestamp
+    Time.now.iso8601
+  end
+
+  def git(cwd, *args)
+    out, err, status = Open3.capture3("git", "-C", cwd, *args)
+    abort err unless status.success?
+
+    out
+  end
+
+  def transaction(mode = :deferred)
+    execute("BEGIN #{mode.to_s.upcase}")
+    yield
+    execute("COMMIT")
+  rescue Exception
+    execute("ROLLBACK") rescue nil
+    raise
+  end
+
+  def execute(sql, *binds)
+    @db.execute(sql, binds.flatten)
+  end
+
+  def execute_batch(sql)
+    @db.execute_batch(sql)
+  end
+
+  def row(sql, *binds)
+    @db.get_first_row(sql, binds.flatten)
+  end
+
+  def rows(sql, *binds)
+    @db.execute(sql, binds.flatten)
+  end
+
+  def say(message)
+    warn message
+  end
+end
+
+command = ARGV.shift
+burndown = Burndown.new
+
+case command
+when "init"
+  burndown.init
+when "refresh"
+  burndown.refresh
+when "backfill"
+  burndown.backfill((ARGV.shift || 2).to_i, (ARGV.shift || 6).to_i)
+when "prune-stale-open"
+  burndown.prune_stale_open
+when "claim"
+  burndown.claim(ARGV.fetch(0))
+when "complete"
+  burndown.complete(ARGV.fetch(0), ARGV.fetch(1), ARGV.fetch(2), ARGV[3])
+when "conflict"
+  burndown.conflict(ARGV.fetch(0), ARGV.fetch(1), ARGV[2])
+when "self-merge"
+  burndown.self_merge(ARGV.fetch(0), ARGV.fetch(1))
+when "status"
+  burndown.status
+when "prompt"
+  burndown.prompt(ARGV.fetch(0))
+when "write-md"
+  burndown.write_md
+else
+  abort <<~USAGE
+    Usage:
+      bin/burndown init
+      bin/burndown refresh
+      bin/burndown backfill [target_open=2] [batch_size=6]
+      bin/burndown prune-stale-open
+      bin/burndown claim <#{AGENTS.join("|")}>
+      bin/burndown complete <agent> <batch_id> <commit_sha> '<checks>'
+      bin/burndown self-merge <agent> <batch_id>
+      bin/burndown conflict <agent> <batch_id> '<notes>'
+      bin/burndown status
+      bin/burndown prompt <agent>
+      bin/burndown write-md
+  USAGE
+end

@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TOOL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SESSION="${BURNDOWN_TMUX_SESSION:-burndown-swarm}"
+ATTACH=1
+RECREATE=0
+
+read -r -a AGENTS <<< "${BURNDOWN_AGENTS:-A B C D}"
+
+usage() {
+  cat <<'USAGE'
+Usage: bin/burndown-tmux [--session NAME] [--no-attach] [--recreate]
+
+Create or attach a tmux session with one pane per burndown agent.
+Run bin/burndown-worktrees init first.
+USAGE
+}
+
+shell_quote() {
+  printf "'%s'" "$(printf "%s" "$1" | sed "s/'/'\\\\''/g")"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --session)
+      SESSION="${2:-}"
+      [ -n "$SESSION" ] || { echo "--session requires a name" >&2; exit 64; }
+      shift
+      ;;
+    --no-attach) ATTACH=0 ;;
+    --recreate) RECREATE=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage >&2; exit 64 ;;
+  esac
+  shift
+done
+
+agent_path() {
+  "$TOOL_ROOT/bin/burndown-worktrees" path "$1"
+}
+
+pane_command() {
+  local agent="$1"
+  local burndown
+
+  burndown="$(shell_quote "$TOOL_ROOT/bin/burndown")"
+
+  printf ". ./.env.burndown 2>/dev/null || true; clear; "
+  printf "prompt() { %s prompt %s; }; " "$burndown" "$agent"
+  printf "claim() { %s claim %s; }; " "$burndown" "$agent"
+  printf "printf 'agent-%s  %%s\\n' \"\$PWD\"; " "$agent"
+  printf "printf 'branch: '; git branch --show-current; "
+  printf "printf '\\ncommands:\\n  prompt  # print this agent prompt\\n  claim   # claim one batch\\n\\n'; "
+}
+
+attach_or_print() {
+  if [ "$ATTACH" = "0" ]; then
+    echo "tmux session ready: $SESSION"
+    return 0
+  fi
+
+  if [ -n "${TMUX:-}" ]; then
+    exec tmux switch-client -t "$SESSION"
+  else
+    exec tmux attach-session -t "$SESSION"
+  fi
+}
+
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "tmux is required" >&2
+  exit 1
+fi
+
+for agent in "${AGENTS[@]}"; do
+  path="$(agent_path "$agent")"
+  if ! git -C "$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "Missing agent-$agent worktree at $path" >&2
+    echo "Run bin/burndown-worktrees init first." >&2
+    exit 1
+  fi
+done
+
+if [ "$RECREATE" = "1" ] && tmux has-session -t "$SESSION" 2>/dev/null; then
+  tmux kill-session -t "$SESSION"
+fi
+
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  attach_or_print
+fi
+
+first_agent="${AGENTS[0]}"
+first_path="$(agent_path "$first_agent")"
+
+tmux new-session -d -s "$SESSION" -n swarm -c "$first_path"
+tmux rename-window -t "$SESSION:swarm" swarm
+
+pane_ids=()
+pane_ids+=("$(tmux display-message -p -t "$SESSION:swarm.0" "#{pane_id}")")
+tmux select-pane -t "${pane_ids[0]}" -T "agent-$first_agent"
+tmux set-option -p -t "${pane_ids[0]}" @agent_label "agent-$first_agent" >/dev/null
+
+for index in "${!AGENTS[@]}"; do
+  [ "$index" -eq 0 ] && continue
+  agent="${AGENTS[$index]}"
+  path="$(agent_path "$agent")"
+  pane_id="$(tmux split-window -t "$SESSION:swarm" -c "$path" -P -F "#{pane_id}")"
+  pane_ids+=("$pane_id")
+  tmux select-pane -t "$pane_id" -T "agent-$agent"
+  tmux set-option -p -t "$pane_id" @agent_label "agent-$agent" >/dev/null
+  tmux select-layout -t "$SESSION:swarm" tiled >/dev/null
+done
+
+tmux set-option -t "$SESSION" pane-border-status top >/dev/null
+tmux set-option -t "$SESSION" pane-border-format "#{@agent_label}" >/dev/null
+
+for index in "${!AGENTS[@]}"; do
+  tmux send-keys -t "${pane_ids[$index]}" "$(pane_command "${AGENTS[$index]}")" C-m
+done
+
+tmux select-pane -t "${pane_ids[0]}"
+attach_or_print

@@ -1,0 +1,26 @@
+You are Agent A in an isolated worktree.
+
+Use the sidecar coordinator:
+
+  ../complexity-burndown-swarm/bin/burndown claim A
+
+Work one claimed batch only.
+
+Rules:
+- Merge latest main before editing.
+- Touch only files and methods listed by the claimed batch.
+- Reduce the listed methods below the next useful complexity threshold.
+- Do not create new complex helper methods.
+- Run focused checks.
+- Commit with a focused message.
+- Record completion with:
+
+  ../complexity-burndown-swarm/bin/burndown complete A <batch_id> <commit_sha> '<checks run>'
+
+- If the merge back to main is clean, run:
+
+  ../complexity-burndown-swarm/bin/burndown self-merge A <batch_id>
+
+- If merge conflicts or looks non-trivial, abort and record:
+
+  ../complexity-burndown-swarm/bin/burndown conflict A <batch_id> '<short reason/files>'

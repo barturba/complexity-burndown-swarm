@@ -1,0 +1,7 @@
+.DS_Store
+.burndown-swarm/
+*.sqlite3
+*.sqlite3-*
+current-complexity.tsv
+BURNDOWN_COORDINATION.md
+tmp/
