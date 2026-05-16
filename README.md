@@ -17,10 +17,7 @@ It was extracted from a real Rails cleanup run and scrubbed for public use. The 
 
 - Product features.
 - UX/copy decisions.
-- Cross-cutting architecture changes.
 - Anything where agents need to invent the acceptance criteria.
-
-For feature work, use a specifier -> architect -> coder -> refactorer -> reviewer loop instead. Complexity burndown is a queue problem; feature building is a product-judgment problem.
 
 ## Architecture
 
